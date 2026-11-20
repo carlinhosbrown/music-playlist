@@ -350,68 +350,99 @@ async function doSearch(q){
 // ── INTERNET ARCHIVE (FULL, sin key) — MEJORADO ──
 // Fix: filtrar por mediatype:audio, ordenar por downloads,
 //      y resolver URL directa del MP3
-async function fetchIA(q,page=1){
-  try{
-    // Query correcta: buscar en títulos+creadores, SOLO audio, ordenado por popularidad
-    const iaQuery=encodeURIComponent(q);
-    const r=await fetch(`https://archive.org/advancedsearch.php?${
-      'q=' + encodeURIComponent('mediatype:(audio) AND (title:(' + q + ') OR creator:(' + q + '))') +
-      '&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=downloads&fl[]=length' +
-      '&sort[]=downloads+desc' +
-      '&rows=15&page=' + page +
-      '&metadata=true&output=json'
-    }`);
-    const j=await r.json();
-    const docs=j.response?.docs||[];
-    iaPage=page;
-    iaTotalPages=j.metadata?.pagination?.pages||1;
+async function fetchIA(q, page = 1) {
+  const results = [];
 
-    // Filtrar: solo docs que tengan longitud (audio real) y downloads
-    const valid=docs.filter(d=>{
-      const len=parseFloat(d.length)||0;
-      return len>10; // al menos 10 segundos
-    });
+  // --- Intento 1: advancedsearch (sencillo, sin campos inexistentes) ---
+  try {
+    const query = encodeURIComponent(q + ' AND mediatype:(audio)');
+    const url =
+      `https://archive.org/advancedsearch.php` +
+      `?q=${query}` +
+      `&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=downloads` +
+      `&rows=15&page=${page}&output=json`;
 
-    searchData.ia=valid.map(d=>({
-      identifier:d.identifier,
-      title:d.title||d.identifier,
-      artist:(d.creator||[]).join(', ')||'—',
-      url:null,
-      cover:null,
-      duration:parseFloat(d.length)||null,
-      downloads:d.downloads||0,
-      source:'ia'
-    }));
+    const r = await fetch(url);
+    if (r.ok) {
+      const j = await r.json();
+      const docs = j.response?.docs || [];
+      iaPage = page;
+      iaTotalPages = j.metadata?.pagination?.pages || 1;
 
-    // Resolver URLs directas de MP3 (una por cada item)
-    await Promise.allSettled(searchData.ia.map(async s=>{
-      try{
-        const dr=await fetch(`https://archive.org/metadata/${s.identifier}`);
-        const dj=await dr.json();
-        const files=dj.files||[];
-        // Preferir MP3, luego cualquier audio
-        let best=files.find(f=>f.format==='MP3')
-               ||files.find(f=>f.format==='VBR MP3')
-               ||files.find(f=>f.format&&f.format.toLowerCase().includes('mp3'))
-               ||files.find(f=>f.format&&f.format.toLowerCase().includes('audio'))
-               ||files.find(f=>f.format&&f.format.toLowerCase().includes('mpeg'));
-        if(best){
-          s.url=`https://archive.org/download/${s.identifier}/${encodeURIComponent(best.name)}`;
+      for (const d of docs) {
+        results.push({
+          identifier: d.identifier,
+          title: d.title || d.identifier,
+          artist: Array.isArray(d.creator) ? d.creator.join(', ') : (d.creator || '—'),
+          url: null, cover: null, duration: null,
+          downloads: d.downloads || 0,
+          source: 'ia'
+        });
+      }
+    }
+  } catch (e) { console.warn('IA attempt1:', e); }
+
+  // --- Intento 2: scrape API (fallback) ---
+  if (!results.length) {
+    try {
+      const url2 = `https://archive.org/services/search/v1/scrape?q=${encodeURIComponent(q)}+mediatype:audio&rows=15&page=${page}`;
+      const r2 = await fetch(url2);
+      if (r2.ok) {
+        const j2 = await r2.json();
+        const docs = j2.docs || j2.response?.docs || [];
+        iaTotalPages = j2.metadata?.pagination?.pages || 1;
+        for (const d of docs) {
+          results.push({
+            identifier: d.identifier,
+            title: d.title || d.identifier,
+            artist: Array.isArray(d.creator) ? d.creator.join(', ') : (d.creator || '—'),
+            url: null, cover: null, duration: null,
+            downloads: d.downloads || 0,
+            source: 'ia'
+          });
         }
-        // Cover: buscar en files una imagen
-        const img=files.find(f=>f.format&&f.format.toLowerCase().includes('image'));
-        if(img) s.cover=`https://archive.org/download/${s.identifier}/${encodeURIComponent(img.name)}`;
-      }catch(e){}
-    }));
+      }
+    } catch (e) { console.warn('IA attempt2:', e); }
+  }
 
-    // Filtrar los que no tienen URL resuelta
-    searchData.ia=searchData.ia.filter(s=>s.url);
-  }catch(e){console.error('IA error',e);}
+  // --- Resolver URL directa del audio (sin Promise.all para no saturar) ---
+  for (const s of results) {
+    if (!s.identifier) continue;
+    try {
+      const mr = await fetch(`https://archive.org/metadata/${s.identifier}`);
+      if (!mr.ok) continue;
+      const mj = await mr.json();
+      const files = mj.files || [];
+
+      // Buscar el mejor archivo de audio (prioridad: mp3 > ogg > flac > m4a > wav)
+      const priority = ['.mp3', '.ogg', '.oga', '.flac', '.m4a', '.aac', '.opus', '.wav'];
+      let best = null;
+      for (const ext of priority) {
+        best = files.find(f => f.name && f.name.toLowerCase().endsWith(ext));
+        if (best) break;
+      }
+      if (!best) best = files.find(f => f.format && /audio|mp3|ogg|flac|m4a|mpeg|wav/i.test(f.format));
+
+      if (best) {
+        s.url = `https://archive.org/download/${s.identifier}/${encodeURIComponent(best.name)}`;
+        // size en bytes → estimar duración (128kbps ≈ 16KB/s)
+        if (best.size) s.duration = Math.round(parseInt(best.size, 10) / 16000);
+      }
+
+      // Cover
+      const img = files.find(f => /\.(jpe?g|png|gif|webp)$/i.test(f.name || ''));
+      if (img) s.cover = `https://archive.org/download/${s.identifier}/${encodeURIComponent(img.name)}`;
+
+    } catch (e) { /* individual item fail — skip */ }
+  }
+
+  // Solo mantener los que tienen URL resuelta
+  searchData.ia = results.filter(s => s.url);
 }
 
-async function loadIAPage(p){
-  iaPage=p;
-  if(iaQuery.length>=2) await fetchIA(iaQuery,p);
+async function loadIAPage(p) {
+  iaPage = p;
+  if (iaQuery.length >= 2) await fetchIA(iaQuery, p);
   renderSearch();
 }
 
