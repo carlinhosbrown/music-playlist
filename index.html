@@ -172,6 +172,34 @@ body.dragging{outline:3px dashed var(--tx);outline-offset:-3px}
 <audio id="audio" crossorigin="anonymous"></audio>
 
 <script>
+
+ // ═══════════════════════════════════════════════════════════
+// PROXY CORS — resuelve el bloqueo de Deezer y Archive.org
+// ═══════════════════════════════════════════════════════════
+const PROXIES = [
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`
+];
+
+async function pfetch(url, opts = {}) {
+  // 1º intento: directo (funciona si el servidor sí da CORS)
+  try {
+    const r = await fetch(url, opts);
+    if (r.ok) return r;
+  } catch (e) { /* CORS block → probar proxies */ }
+
+  // 2º intento: proxies en secuencia
+  for (const makeProxy of PROXIES) {
+    try {
+      const r = await fetch(makeProxy(url), { ...opts, method: opts.method || 'GET' });
+      if (r.ok) return r;
+    } catch (e) { /* siguiente proxy */ }
+  }
+
+  throw new Error('Todos los proxies fallaron: ' + url);
+} 
+  
 // ═══════════════════════════════════════════════════════════
 // ESTADO GLOBAL
 // ═══════════════════════════════════════════════════════════
@@ -352,91 +380,61 @@ async function doSearch(q){
 //      y resolver URL directa del MP3
 async function fetchIA(q, page = 1) {
   const results = [];
+  iaPage = page;
+  iaTotalPages = 1;
 
-  // --- Intento 1: advancedsearch (sencillo, sin campos inexistentes) ---
   try {
-    const query = encodeURIComponent(q + ' AND mediatype:(audio)');
     const url =
       `https://archive.org/advancedsearch.php` +
-      `?q=${query}` +
+      `?q=${encodeURIComponent('mediatype:(audio) AND (' + q + ')')}` +
       `&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=downloads` +
       `&rows=15&page=${page}&output=json`;
 
-    const r = await fetch(url);
-    if (r.ok) {
-      const j = await r.json();
-      const docs = j.response?.docs || [];
-      iaPage = page;
-      iaTotalPages = j.metadata?.pagination?.pages || 1;
+    const r = await pfetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const docs = j.response?.docs || [];
+    iaTotalPages = j.metadata?.pagination?.pages || 1;
 
-      for (const d of docs) {
-        results.push({
-          identifier: d.identifier,
-          title: d.title || d.identifier,
-          artist: Array.isArray(d.creator) ? d.creator.join(', ') : (d.creator || '—'),
-          url: null, cover: null, duration: null,
-          downloads: d.downloads || 0,
-          source: 'ia'
-        });
-      }
+    for (const d of docs) {
+      results.push({
+        identifier: d.identifier,
+        title: d.title || d.identifier,
+        artist: Array.isArray(d.creator) ? d.creator.join(', ') : (d.creator || '—'),
+        url: null, cover: null, duration: null,
+        downloads: d.downloads || 0,
+        source: 'ia'
+      });
     }
-  } catch (e) { console.warn('IA attempt1:', e); }
+  } catch (e) { console.warn('IA search:', e); }
 
-  // --- Intento 2: scrape API (fallback) ---
-  if (!results.length) {
-    try {
-      const url2 = `https://archive.org/services/search/v1/scrape?q=${encodeURIComponent(q)}+mediatype:audio&rows=15&page=${page}`;
-      const r2 = await fetch(url2);
-      if (r2.ok) {
-        const j2 = await r2.json();
-        const docs = j2.docs || j2.response?.docs || [];
-        iaTotalPages = j2.metadata?.pagination?.pages || 1;
-        for (const d of docs) {
-          results.push({
-            identifier: d.identifier,
-            title: d.title || d.identifier,
-            artist: Array.isArray(d.creator) ? d.creator.join(', ') : (d.creator || '—'),
-            url: null, cover: null, duration: null,
-            downloads: d.downloads || 0,
-            source: 'ia'
-          });
-        }
-      }
-    } catch (e) { console.warn('IA attempt2:', e); }
-  }
-
-  // --- Resolver URL directa del audio (sin Promise.all para no saturar) ---
+  // Resolver URL directa del MP3 (secuencial, sin saturar)
   for (const s of results) {
     if (!s.identifier) continue;
     try {
-      const mr = await fetch(`https://archive.org/metadata/${s.identifier}`);
+      const mr = await pfetch(`https://archive.org/metadata/${s.identifier}`);
       if (!mr.ok) continue;
       const mj = await mr.json();
       const files = mj.files || [];
 
-      // Buscar el mejor archivo de audio (prioridad: mp3 > ogg > flac > m4a > wav)
-      const priority = ['.mp3', '.ogg', '.oga', '.flac', '.m4a', '.aac', '.opus', '.wav'];
+      const priority = ['.mp3', '.ogg', '.oga', '.flac', '.m4a', '.aac', '.opus'];
       let best = null;
       for (const ext of priority) {
         best = files.find(f => f.name && f.name.toLowerCase().endsWith(ext));
         if (best) break;
       }
-      if (!best) best = files.find(f => f.format && /audio|mp3|ogg|flac|m4a|mpeg|wav/i.test(f.format));
+      if (!best) best = files.find(f => f.format && /audio|mp3|ogg|flac|m4a|mpeg/i.test(f.format));
 
       if (best) {
         s.url = `https://archive.org/download/${s.identifier}/${encodeURIComponent(best.name)}`;
-        // size en bytes → estimar duración (128kbps ≈ 16KB/s)
         if (best.size) s.duration = Math.round(parseInt(best.size, 10) / 16000);
       }
 
-      // Cover
       const img = files.find(f => /\.(jpe?g|png|gif|webp)$/i.test(f.name || ''));
       if (img) s.cover = `https://archive.org/download/${s.identifier}/${encodeURIComponent(img.name)}`;
-
-    } catch (e) { /* individual item fail — skip */ }
+    } catch (e) { /* skip item */ }
   }
 
-  // Solo mantener los que tienen URL resuelta
   searchData.ia = results.filter(s => s.url);
 }
 
@@ -447,16 +445,20 @@ async function loadIAPage(p) {
 }
 
 // ── DEEZER (preview) ──
-async function fetchDeezer(q){
-  try{
-    const r=await fetch(`https://api.deezer.com/search/track?q=${encodeURIComponent(q)}&limit=10`);
-    const j=await r.json();
-    searchData.dz=(j.data||[]).map(t=>({
-      title:t.title,artist:t.artist?.name||'?',
-      url:t.preview,cover:t.album?.cover_medium||null,
-      duration:30,source:'dz'
-    })).filter(t=>t.url);
-  }catch(e){}
+  
+async function fetchDeezer(q) {
+  try {
+    const r = await pfetch(`https://api.deezer.com/search/track?q=${encodeURIComponent(q)}&limit=10`);
+    const j = await r.json();
+    searchData.dz = (j.data || []).map(t => ({
+      title: t.title,
+      artist: t.artist?.name || '?',
+      url: t.preview,
+      cover: t.album?.cover_medium || null,
+      duration: 30,
+      source: 'dz'
+    })).filter(t => t.url);
+  } catch (e) { console.warn('Deezer:', e); }
 }
 
 // ── iTUNES (preview) ──
